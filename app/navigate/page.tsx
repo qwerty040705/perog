@@ -206,14 +206,9 @@ function findNearestRouteSegment(
   }
 
   /*
-   * 매우 중요:
-   *
-   * 순환형 / 왕복형은
-   * route[0]과 route[end]가 A 근처이므로
-   * 처음부터 route 전체를 검색하면
-   * 마지막 segment에 매칭될 수 있다.
-   *
-   * 따라서 이전 진행 위치 주변만 검색한다.
+   * 순환형 / 왕복형에서는 시작점과 종점이
+   * 같은 장소일 수 있으므로 route 전체를
+   * 매번 검색하지 않고 현재 진행 위치 주변만 검색한다.
    */
 
   const startIndex = Math.max(0, previousSegmentIndex - 10);
@@ -316,7 +311,7 @@ function findUpcomingTurn(route: RoutePoint[], match: RouteMatch): TurnInstructi
     }
 
     /*
-     * 좌/우회전 안내는 20m 이내에서만.
+     * 좌/우회전 안내는 20m 이내에서만 보여준다.
      */
     if (distanceFromCurrent > TURN_DISPLAY_DISTANCE_METERS) {
       break;
@@ -473,8 +468,7 @@ export default function NavigatePage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   /*
-   * 순환형/왕복형 최초 매칭이
-   * route 마지막으로 튀지 않도록 0에서 시작한다.
+   * 항상 route 시작 부분부터 navigation tracking 시작.
    */
   const lastRouteSegmentRef = useRef<number>(0);
 
@@ -499,7 +493,7 @@ export default function NavigatePage() {
   const [isCameraStarting, setIsCameraStarting] = useState(true);
 
   /* ==================================================
-   * 저장된 route
+   * Saved route
    * ================================================== */
 
   useEffect(() => {
@@ -518,9 +512,6 @@ export default function NavigatePage() {
         throw new Error("올바른 경로가 아닙니다.");
       }
 
-      /*
-       * 새 경로를 불러오면 진행상태 초기화.
-       */
       lastRouteSegmentRef.current = 0;
       smoothedPositionRef.current = null;
 
@@ -681,6 +672,7 @@ export default function NavigatePage() {
       }
 
       setOrientationEnabled(true);
+
       setOrientationError(null);
     } catch (error) {
       console.error("Orientation permission failed:", error);
@@ -740,10 +732,6 @@ export default function NavigatePage() {
 
     const match = findNearestRouteSegment(route, currentPosition, lastRouteSegmentRef.current);
 
-    /*
-     * route 진행 index는 앞으로 진행시키되,
-     * GPS 튐 때문에 갑자기 너무 뒤로 가지 않도록 한다.
-     */
     if (match.segmentIndex >= lastRouteSegmentRef.current - 3) {
       lastRouteSegmentRef.current = match.segmentIndex;
     }
@@ -756,13 +744,6 @@ export default function NavigatePage() {
 
     const remainingDistanceMeters = remainingRouteDistance(route, match);
 
-    /*
-     * 단순 좌표 거리만으로 도착 판정하면
-     * 순환형 / 왕복형에서 시작하자마자
-     * A가 도착점이라 도착으로 잘못 판단할 수 있다.
-     *
-     * 따라서 경로 진행률을 반드시 같이 본다.
-     */
     const progressRatio =
       route.length > 1 ? (match.segmentIndex + match.segmentFraction) / (route.length - 1) : 0;
 
@@ -796,13 +777,17 @@ export default function NavigatePage() {
    * ================================================== */
 
   const activeHeading = useMemo(() => {
+    /*
+     * 방향 센서 값을 우선 사용.
+     */
     if (deviceHeading !== null) {
       return deviceHeading;
     }
 
     /*
-     * DeviceOrientation이 없을 경우
-     * 실제 움직일 때 GPS heading 사용.
+     * 방향센서가 없고
+     * 실제로 움직이고 있을 때는
+     * GPS heading을 fallback으로 사용.
      */
     if (
       currentPosition?.gpsHeading !== null &&
@@ -815,13 +800,21 @@ export default function NavigatePage() {
     return null;
   }, [deviceHeading, currentPosition]);
 
-  const arrowRotation = useMemo(() => {
+  /*
+   * TARGET - HEADING
+   *
+   * + : 화면 기준 오른쪽
+   * - : 화면 기준 왼쪽
+   */
+  const headingDifference = useMemo(() => {
     if (!navigationState || activeHeading === null) {
-      return 0;
+      return null;
     }
 
     return normalizeAngle(navigationState.targetBearing - activeHeading);
   }, [navigationState, activeHeading]);
+
+  const arrowRotation = headingDifference ?? 0;
 
   /* ==================================================
    * Route validity
@@ -861,11 +854,28 @@ export default function NavigatePage() {
           ? `경로 오차 ${Math.round(navigationState.routeMatch.distanceMeters)}m`
           : (gpsError ?? "현재 위치를 확인하고 있습니다.");
 
+  /* ==================================================
+   * Debug values
+   * ================================================== */
+
+  const debugHeading = activeHeading !== null ? `${Math.round(activeHeading)}°` : "-";
+
+  const debugTarget = navigationState ? `${Math.round(navigationState.targetBearing)}°` : "-";
+
+  const debugDiff =
+    headingDifference !== null
+      ? `${headingDifference > 0 ? "+" : ""}${Math.round(headingDifference)}°`
+      : "-";
+
   return (
     <main className="navigation-page">
       <video ref={videoRef} className="navigation-camera" autoPlay playsInline muted />
 
       <div className="navigation-overlay">
+        {/* ==================================================
+            Top
+            ================================================== */}
+
         <div className="navigation-top">
           <button className="navigation-back-button" type="button" onClick={() => router.back()}>
             ←
@@ -883,6 +893,34 @@ export default function NavigatePage() {
             </div>
           )}
         </div>
+
+        {/* ==================================================
+            Heading debug
+            ================================================== */}
+
+        <div className="navigation-debug">
+          <div>
+            <small>HEADING</small>
+
+            <strong>{debugHeading}</strong>
+          </div>
+
+          <div>
+            <small>TARGET</small>
+
+            <strong>{debugTarget}</strong>
+          </div>
+
+          <div>
+            <small>DIFF</small>
+
+            <strong>{debugDiff}</strong>
+          </div>
+        </div>
+
+        {/* ==================================================
+            Center
+            ================================================== */}
 
         <div className="navigation-center">
           {isCameraStarting ? (
@@ -913,9 +951,11 @@ export default function NavigatePage() {
                 }
                 style={{
                   /*
-                   * 직진 화살표만 실제 진행 방향에 맞춰 회전.
+                   * 평상시 직진 화살표만
+                   * 실제 가야 할 방향을 향하도록 회전한다.
                    *
-                   * 좌/우회전 아이콘 자체는 고정된 안내 표지처럼 보여준다.
+                   * 좌/우회전 아이콘은
+                   * 고정된 navigation symbol이다.
                    */
                   transform:
                     !isOffRoute && visibleArrowType === "straight"
@@ -940,6 +980,10 @@ export default function NavigatePage() {
             </>
           )}
         </div>
+
+        {/* ==================================================
+            Bottom
+            ================================================== */}
 
         <div className="navigation-bottom">
           <div>

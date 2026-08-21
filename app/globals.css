@@ -3362,3 +3362,56 @@ button {
 
   color: #ffb547;
 }
+/* ==================================================
+   Navigation heading debug
+   ================================================== */
+
+.navigation-debug {
+  position: absolute;
+  z-index: 20;
+
+  top: 90px;
+  right: 20px;
+
+  min-width: 142px;
+
+  padding: 10px 12px;
+
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+
+  border: 1px solid rgba(198, 255, 0, 0.28);
+  border-radius: 12px;
+
+  background: rgba(7, 8, 7, 0.76);
+
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+
+  pointer-events: none;
+}
+
+.navigation-debug > div {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 18px;
+}
+
+.navigation-debug small {
+  color: rgba(245, 247, 242, 0.55);
+
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+}
+
+.navigation-debug strong {
+  color: #c6ff00;
+
+  font-size: 12px;
+  font-weight: 800;
+
+  font-variant-numeric: tabular-nums;
+}
