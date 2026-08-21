@@ -57,23 +57,74 @@ type NavigationState = {
  * Constants
  * ================================================== */
 
+/*
+ * 평상시 진행 방향을 계산할 때
+ * 현재 위치보다 약 35m 앞의 route를 목표로 한다.
+ */
 const STRAIGHT_LOOK_AHEAD_METERS = 35;
 
+/*
+ * 좌/우회전 아이콘은 실제 회전 지점이
+ * 20m 이내에 있을 때만 보여준다.
+ */
 const TURN_DISPLAY_DISTANCE_METERS = 20;
 
-const TURN_THRESHOLD_DEGREES = 38;
+/*
+ * 55도 이상 꺾이는 경우만 실제 turn으로 본다.
+ *
+ * 기존 38도보다 보수적으로 설정해서
+ * 굽은 보행로를 우회전/좌회전으로
+ * 오인하는 것을 줄인다.
+ */
+const TURN_THRESHOLD_DEGREES = 55;
 
-const TURN_SAMPLE_DISTANCE_METERS = 12;
+/*
+ * 회전 지점 앞뒤 각각 약 18m의
+ * 전체적인 방향을 비교한다.
+ */
+const TURN_SAMPLE_DISTANCE_METERS = 18;
 
+/*
+ * 현재 위치 바로 앞 5m 이내의
+ * polyline 굴곡은 turn으로 표시하지 않는다.
+ *
+ * "1m 후 우회전" 같은 오탐 방지.
+ */
+const MIN_TURN_DISTANCE_METERS = 5;
+
+/*
+ * 목적지 15m 이내.
+ */
 const FINISH_THRESHOLD_METERS = 15;
 
+/*
+ * 순환형 / 왕복형에서 시작점을
+ * 도착점으로 잘못 판단하지 않도록
+ * route를 90% 이상 진행해야 finish 가능.
+ */
 const FINISH_PROGRESS_RATIO = 0.9;
 
+/*
+ * 기본 경로 이탈 허용 거리.
+ */
 const MIN_OFF_ROUTE_METERS = 20;
 
+/*
+ * GPS accuracy가 60m보다 나쁘면
+ * off-route 판정을 확정하지 않는다.
+ */
 const MAX_RELIABLE_GPS_ACCURACY_METERS = 60;
 
+/*
+ * GPS 위치 smoothing.
+ */
 const GPS_SMOOTHING_ALPHA = 0.38;
+
+/*
+ * 방향센서 React 업데이트 최대 주기.
+ * 100ms = 최대 10Hz.
+ */
+const ORIENTATION_UPDATE_INTERVAL_MS = 100;
 
 /* ==================================================
  * Math
@@ -94,6 +145,7 @@ function haversineMeters(a: RoutePoint, b: RoutePoint) {
   const lat2 = toRadians(b.latitude);
 
   const dLat = toRadians(b.latitude - a.latitude);
+
   const dLon = toRadians(b.longitude - a.longitude);
 
   const sinLat = Math.sin(dLat / 2);
@@ -106,6 +158,7 @@ function haversineMeters(a: RoutePoint, b: RoutePoint) {
 
 function bearingDegrees(from: RoutePoint, to: RoutePoint) {
   const lat1 = toRadians(from.latitude);
+
   const lat2 = toRadians(to.latitude);
 
   const dLon = toRadians(to.longitude - from.longitude);
@@ -152,9 +205,11 @@ function toLocalPoint(point: RoutePoint, origin: RoutePoint): LocalPoint {
 
 function projectPointToSegment(current: RoutePoint, from: RoutePoint, to: RoutePoint) {
   const a = toLocalPoint(from, current);
+
   const b = toLocalPoint(to, current);
 
   const dx = b.x - a.x;
+
   const dy = b.y - a.y;
 
   const lengthSquared = dx * dx + dy * dy;
@@ -206,9 +261,16 @@ function findNearestRouteSegment(
   }
 
   /*
-   * 순환형 / 왕복형에서는 시작점과 종점이
-   * 같은 장소일 수 있으므로 route 전체를
-   * 매번 검색하지 않고 현재 진행 위치 주변만 검색한다.
+   * 순환형 / 왕복형에서는
+   *
+   * route 시작점 A
+   * route 마지막점 A
+   *
+   * 가 같은 위치일 수 있다.
+   *
+   * 따라서 route 전체를
+   * 매번 검색하지 않고
+   * 현재 진행 index 주변만 검색한다.
    */
 
   const startIndex = Math.max(0, previousSegmentIndex - 10);
@@ -216,7 +278,9 @@ function findNearestRouteSegment(
   const endIndex = Math.min(route.length - 2, previousSegmentIndex + 60);
 
   let bestSegmentIndex = startIndex;
+
   let bestFraction = 0;
+
   let bestDistance = Infinity;
 
   for (let index = startIndex; index <= endIndex; index += 1) {
@@ -226,6 +290,7 @@ function findNearestRouteSegment(
       bestDistance = projected.distanceMeters;
 
       bestSegmentIndex = index;
+
       bestFraction = projected.fraction;
     }
   }
@@ -238,8 +303,11 @@ function findNearestRouteSegment(
 
   return {
     segmentIndex: bestSegmentIndex,
+
     segmentFraction: bestFraction,
+
     distanceMeters: bestDistance,
+
     matchedPoint,
   };
 }
@@ -303,6 +371,10 @@ function findBackwardIndexAtDistance(
 function findUpcomingTurn(route: RoutePoint[], match: RouteMatch): TurnInstruction {
   const startIndex = Math.min(match.segmentIndex + 1, route.length - 1);
 
+  /*
+   * matched point부터
+   * 다음 route point까지의 거리.
+   */
   let distanceFromCurrent = haversineMeters(match.matchedPoint, route[startIndex]);
 
   for (let candidateIndex = startIndex; candidateIndex < route.length - 1; candidateIndex += 1) {
@@ -311,10 +383,23 @@ function findUpcomingTurn(route: RoutePoint[], match: RouteMatch): TurnInstructi
     }
 
     /*
-     * 좌/우회전 안내는 20m 이내에서만 보여준다.
+     * 20m보다 먼 turn은
+     * 아직 보여주지 않는다.
      */
     if (distanceFromCurrent > TURN_DISPLAY_DISTANCE_METERS) {
       break;
+    }
+
+    /*
+     * 너무 가까운 polyline 굴곡은
+     * 실제 교차로 turn이 아니라
+     * GPS/polyline geometry일
+     * 가능성이 높기 때문에 무시.
+     *
+     * 1m 후 우회전 방지.
+     */
+    if (distanceFromCurrent < MIN_TURN_DISTANCE_METERS) {
+      continue;
     }
 
     const beforeIndex = findBackwardIndexAtDistance(
@@ -335,27 +420,40 @@ function findUpcomingTurn(route: RoutePoint[], match: RouteMatch): TurnInstructi
 
     const turnAngle = normalizeAngle(outgoingBearing - incomingBearing);
 
+    /*
+     * 55도 미만의 방향 변화는
+     * 단순한 곡선으로 보고
+     * turn으로 표시하지 않는다.
+     */
     if (Math.abs(turnAngle) < TURN_THRESHOLD_DEGREES) {
       continue;
     }
 
-    const roundedDistance = Math.max(1, Math.round(distanceFromCurrent));
+    const roundedDistance = Math.max(MIN_TURN_DISTANCE_METERS, Math.round(distanceFromCurrent));
 
     if (turnAngle > 0) {
       return {
         type: "right",
+
         text: `${roundedDistance}m 후 우회전`,
+
         distanceMeters: distanceFromCurrent,
       };
     }
 
     return {
       type: "left",
+
       text: `${roundedDistance}m 후 좌회전`,
+
       distanceMeters: distanceFromCurrent,
     };
   }
 
+  /*
+   * 20m 안에 확실한 turn이 없으면
+   * 무조건 평상시 진행 방향 안내.
+   */
   return {
     type: "straight",
     text: "직진하세요",
@@ -368,11 +466,20 @@ function findUpcomingTurn(route: RoutePoint[], match: RouteMatch): TurnInstructi
  * ================================================== */
 
 function NavigationArrowIcon({ type }: { type: TurnType | "invalid" }) {
+  /*
+   * 경로 이탈
+   */
   if (type === "invalid") {
     return (
       <svg viewBox="0 0 120 120" aria-hidden="true">
         <path
-          d="M30 30L90 90M90 30L30 90"
+          d="
+            M30 30
+            L90 90
+
+            M90 30
+            L30 90
+          "
           fill="none"
           stroke="currentColor"
           strokeWidth="13"
@@ -382,6 +489,9 @@ function NavigationArrowIcon({ type }: { type: TurnType | "invalid" }) {
     );
   }
 
+  /*
+   * 좌회전
+   */
   if (type === "left") {
     return (
       <svg viewBox="0 0 120 120" aria-hidden="true">
@@ -389,8 +499,13 @@ function NavigationArrowIcon({ type }: { type: TurnType | "invalid" }) {
           d="
             M78 102
             V68
-            C78 48 65 36 46 36
+
+            C78 48
+             65 36
+             46 36
+
             H27
+
             M44 19
             L27 36
             L44 53
@@ -405,6 +520,9 @@ function NavigationArrowIcon({ type }: { type: TurnType | "invalid" }) {
     );
   }
 
+  /*
+   * 우회전
+   */
   if (type === "right") {
     return (
       <svg viewBox="0 0 120 120" aria-hidden="true">
@@ -412,8 +530,13 @@ function NavigationArrowIcon({ type }: { type: TurnType | "invalid" }) {
           d="
             M42 102
             V68
-            C42 48 55 36 74 36
+
+            C42 48
+             55 36
+             74 36
+
             H93
+
             M76 19
             L93 36
             L76 53
@@ -428,6 +551,9 @@ function NavigationArrowIcon({ type }: { type: TurnType | "invalid" }) {
     );
   }
 
+  /*
+   * 도착
+   */
   if (type === "finish") {
     return (
       <svg viewBox="0 0 120 120" aria-hidden="true">
@@ -438,12 +564,16 @@ function NavigationArrowIcon({ type }: { type: TurnType | "invalid" }) {
     );
   }
 
+  /*
+   * 일반 진행 방향
+   */
   return (
     <svg viewBox="0 0 120 120" aria-hidden="true">
       <path
         d="
           M60 103
           V27
+
           M35 52
           L60 27
           L85 52
@@ -468,7 +598,11 @@ export default function NavigatePage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   /*
-   * 항상 route 시작 부분부터 navigation tracking 시작.
+   * route 시작 index.
+   *
+   * 순환형 / 왕복형이
+   * 마지막 segment에서
+   * 시작되는 것을 방지.
    */
   const lastRouteSegmentRef = useRef<number>(0);
 
@@ -513,6 +647,7 @@ export default function NavigatePage() {
       }
 
       lastRouteSegmentRef.current = 0;
+
       smoothedPositionRef.current = null;
 
       setNavigationData(parsed);
@@ -625,6 +760,7 @@ export default function NavigatePage() {
       (error) => {
         console.error("GPS error:", {
           code: error.code,
+
           message: error.message,
         });
 
@@ -641,7 +777,9 @@ export default function NavigatePage() {
 
       {
         enableHighAccuracy: true,
+
         maximumAge: 0,
+
         timeout: 30_000,
       }
     );
@@ -690,31 +828,52 @@ export default function NavigatePage() {
       return;
     }
 
+    let lastUpdateTime = 0;
+
     const handleOrientation = (event: DeviceOrientationEvent) => {
+      const now = performance.now();
+
+      /*
+       * 방향센서는 이벤트가
+       * 매우 빠르게 들어오므로
+       * 최대 10Hz로 제한.
+       */
+      if (now - lastUpdateTime < ORIENTATION_UPDATE_INTERVAL_MS) {
+        return;
+      }
+
+      lastUpdateTime = now;
+
       const iosHeading = (
         event as DeviceOrientationEvent & {
           webkitCompassHeading?: number;
         }
       ).webkitCompassHeading;
 
+      /*
+       * iPhone Safari에서는
+       * webkitCompassHeading 우선.
+       */
       if (typeof iosHeading === "number" && Number.isFinite(iosHeading)) {
         setDeviceHeading(iosHeading);
 
         return;
       }
 
+      /*
+       * fallback.
+       */
       if (typeof event.alpha === "number" && Number.isFinite(event.alpha)) {
         setDeviceHeading((360 - event.alpha) % 360);
       }
     };
 
-    window.addEventListener("deviceorientationabsolute", handleOrientation, true);
-
+    /*
+     * deviceorientation 하나만 사용.
+     */
     window.addEventListener("deviceorientation", handleOrientation, true);
 
     return () => {
-      window.removeEventListener("deviceorientationabsolute", handleOrientation, true);
-
       window.removeEventListener("deviceorientation", handleOrientation, true);
     };
   }, [orientationEnabled]);
@@ -732,10 +891,19 @@ export default function NavigatePage() {
 
     const match = findNearestRouteSegment(route, currentPosition, lastRouteSegmentRef.current);
 
+    /*
+     * GPS가 잠깐 튀어도
+     * route index가 크게
+     * 뒤로 돌아가지 않게 한다.
+     */
     if (match.segmentIndex >= lastRouteSegmentRef.current - 3) {
       lastRouteSegmentRef.current = match.segmentIndex;
     }
 
+    /*
+     * 현재 위치에서
+     * 약 35m 앞의 route 방향.
+     */
     const targetIndex = findIndexAtDistance(route, match.segmentIndex, STRAIGHT_LOOK_AHEAD_METERS);
 
     const target = route[targetIndex] ?? route[route.length - 1];
@@ -744,18 +912,35 @@ export default function NavigatePage() {
 
     const remainingDistanceMeters = remainingRouteDistance(route, match);
 
+    /*
+     * route 진행률.
+     *
+     * 순환형 / 왕복형의
+     * 출발점 = 목적지 문제를
+     * 방지하기 위해 사용.
+     */
     const progressRatio =
       route.length > 1 ? (match.segmentIndex + match.segmentFraction) / (route.length - 1) : 0;
 
     let turnInstruction: TurnInstruction;
 
+    /*
+     * 목적지는
+     *
+     * 1. route 90% 이상 진행
+     * 2. 남은 거리 15m 이내
+     *
+     * 두 조건 모두 만족해야 한다.
+     */
     if (
       progressRatio >= FINISH_PROGRESS_RATIO &&
       remainingDistanceMeters <= FINISH_THRESHOLD_METERS
     ) {
       turnInstruction = {
         type: "finish",
+
         text: "목적지에 도착했습니다",
+
         distanceMeters: remainingDistanceMeters,
       };
     } else {
@@ -764,30 +949,35 @@ export default function NavigatePage() {
 
     setNavigationState({
       routeMatch: match,
+
       targetIndex,
+
       targetBearing,
+
       remainingDistanceMeters,
+
       progressRatio,
+
       turnInstruction,
     });
   }, [navigationData, currentPosition]);
 
   /* ==================================================
-   * Heading
+   * Active heading
    * ================================================== */
 
   const activeHeading = useMemo(() => {
     /*
-     * 방향 센서 값을 우선 사용.
+     * 방향센서 우선.
      */
     if (deviceHeading !== null) {
       return deviceHeading;
     }
 
     /*
-     * 방향센서가 없고
-     * 실제로 움직이고 있을 때는
-     * GPS heading을 fallback으로 사용.
+     * 방향 센서를 못 쓰는 경우
+     * 실제 이동 중이면
+     * GPS heading fallback.
      */
     if (
       currentPosition?.gpsHeading !== null &&
@@ -800,11 +990,24 @@ export default function NavigatePage() {
     return null;
   }, [deviceHeading, currentPosition]);
 
+  /* ==================================================
+   * Heading difference
+   * ================================================== */
+
   /*
    * TARGET - HEADING
    *
-   * + : 화면 기준 오른쪽
-   * - : 화면 기준 왼쪽
+   * 0°:
+   * 정면
+   *
+   * +90°:
+   * 오른쪽
+   *
+   * -90°:
+   * 왼쪽
+   *
+   * ±180°:
+   * 뒤쪽
    */
   const headingDifference = useMemo(() => {
     if (!navigationState || activeHeading === null) {
@@ -823,13 +1026,26 @@ export default function NavigatePage() {
   const gpsReliable =
     currentPosition !== null && currentPosition.accuracy <= MAX_RELIABLE_GPS_ACCURACY_METERS;
 
+  /*
+   * GPS accuracy가 좋지 않으면
+   * off-route 허용 거리도
+   * 자동으로 조금 늘어난다.
+   */
   const offRouteThreshold = currentPosition
-    ? Math.max(MIN_OFF_ROUTE_METERS, currentPosition.accuracy * 1.25)
+    ? Math.max(
+        MIN_OFF_ROUTE_METERS,
+
+        currentPosition.accuracy * 1.25
+      )
     : MIN_OFF_ROUTE_METERS;
 
   const isOffRoute = Boolean(
     navigationState && gpsReliable && navigationState.routeMatch.distanceMeters > offRouteThreshold
   );
+
+  /* ==================================================
+   * Display values
+   * ================================================== */
 
   const remainingKm = navigationState
     ? navigationState.remainingDistanceMeters / 1000
@@ -867,13 +1083,17 @@ export default function NavigatePage() {
       ? `${headingDifference > 0 ? "+" : ""}${Math.round(headingDifference)}°`
       : "-";
 
+  /* ==================================================
+   * Render
+   * ================================================== */
+
   return (
     <main className="navigation-page">
       <video ref={videoRef} className="navigation-camera" autoPlay playsInline muted />
 
       <div className="navigation-overlay">
         {/* ==================================================
-            Top
+            TOP
             ================================================== */}
 
         <div className="navigation-top">
@@ -895,7 +1115,7 @@ export default function NavigatePage() {
         </div>
 
         {/* ==================================================
-            Heading debug
+            DEBUG
             ================================================== */}
 
         <div className="navigation-debug">
@@ -919,7 +1139,25 @@ export default function NavigatePage() {
         </div>
 
         {/* ==================================================
-            Center
+            ORIENTATION PERMISSION
+            ================================================== */}
+
+        {!orientationEnabled && (
+          <button
+            type="button"
+            className="navigation-orientation-button-fixed"
+            onClick={enableOrientation}
+          >
+            방향 센서 시작
+          </button>
+        )}
+
+        {orientationError && (
+          <div className="navigation-orientation-error-fixed">{orientationError}</div>
+        )}
+
+        {/* ==================================================
+            CENTER
             ================================================== */}
 
         <div className="navigation-center">
@@ -929,20 +1167,6 @@ export default function NavigatePage() {
             <div className="navigation-status navigation-status--error">{cameraError}</div>
           ) : (
             <>
-              {!orientationEnabled && (
-                <button
-                  type="button"
-                  className="navigation-orientation-button"
-                  onClick={enableOrientation}
-                >
-                  방향 센서 시작
-                </button>
-              )}
-
-              {orientationError && (
-                <div className="navigation-orientation-error">{orientationError}</div>
-              )}
-
               <div
                 className={
                   isOffRoute
@@ -951,11 +1175,11 @@ export default function NavigatePage() {
                 }
                 style={{
                   /*
-                   * 평상시 직진 화살표만
-                   * 실제 가야 할 방향을 향하도록 회전한다.
+                   * 평상시에는 화살표가
+                   * 실제 가야 할 방향을 가리킨다.
                    *
-                   * 좌/우회전 아이콘은
-                   * 고정된 navigation symbol이다.
+                   * 좌/우회전 turn icon은
+                   * 표지판처럼 고정해서 보여준다.
                    */
                   transform:
                     !isOffRoute && visibleArrowType === "straight"
@@ -982,7 +1206,7 @@ export default function NavigatePage() {
         </div>
 
         {/* ==================================================
-            Bottom
+            BOTTOM
             ================================================== */}
 
         <div className="navigation-bottom">
