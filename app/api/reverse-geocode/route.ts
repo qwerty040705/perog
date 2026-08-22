@@ -6,6 +6,7 @@ type KakaoCoordAddressResponse = {
 };
 
 const KAKAO_COORD_TO_ADDRESS_URL = "https://dapi.kakao.com/v2/local/geo/coord2address.json";
+const KAKAO_REQUEST_TIMEOUT_MS = 8_000;
 
 export async function GET(request: NextRequest) {
   const apiKey = process.env.KAKAO_REST_API_KEY;
@@ -27,6 +28,7 @@ export async function GET(request: NextRequest) {
     const response = await fetch(`${KAKAO_COORD_TO_ADDRESS_URL}?${params.toString()}`, {
       headers: { Authorization: `KakaoAK ${apiKey}` },
       cache: "no-store",
+      signal: AbortSignal.timeout(KAKAO_REQUEST_TIMEOUT_MS),
     });
 
     if (!response.ok) {

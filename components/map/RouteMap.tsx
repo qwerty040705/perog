@@ -284,6 +284,10 @@ export default function RouteMap({
     void renderMap();
     return () => {
       cancelled = true;
+      overlaysRef.current.forEach((overlay) => overlay.setMap(null));
+      overlaysRef.current = [];
+      directionOverlaysRef.current.forEach((overlay) => overlay.setMap(null));
+      directionOverlaysRef.current = [];
     };
   }, [route, routeType, locationA, locationB, requiredItems]);
 

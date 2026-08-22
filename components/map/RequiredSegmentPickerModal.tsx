@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { loadKakaoMapsSdk } from "@/lib/kakao-map";
 
 type RoutePoint = { latitude: number; longitude: number };
@@ -22,15 +22,15 @@ export default function RequiredSegmentPickerModal({ open, initialCenter, onClos
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const reverseGeocode = async (point: RoutePoint, fallbackName: string): Promise<SelectedLocation> => {
+  const reverseGeocode = useCallback(async (point: RoutePoint, fallbackName: string): Promise<SelectedLocation> => {
     try {
       const response = await fetch(`/api/reverse-geocode?${new URLSearchParams({ lat: String(point.latitude), lon: String(point.longitude) })}`);
       const data = (await response.json()) as { location?: { name?: string; address?: string } };
       return { ...point, name: data.location?.name ?? fallbackName, address: data.location?.address ?? "주소 정보 없음" };
     } catch { return { ...point, name: fallbackName, address: "주소 정보 없음" }; }
-  };
+  }, []);
 
-  const requestSegment = async (segmentStart: SelectedLocation, segmentEnd: SelectedLocation) => {
+  const requestSegment = useCallback(async (segmentStart: SelectedLocation, segmentEnd: SelectedLocation) => {
     setIsLoading(true); setError(""); setRoute([]); setDistanceKm(null);
     try {
       const response = await fetch("/api/pedestrian-segment", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ start: segmentStart, end: segmentEnd }) });
@@ -39,13 +39,13 @@ export default function RequiredSegmentPickerModal({ open, initialCenter, onClos
       setRoute(data.route); setDistanceKm(data.distanceKm);
     } catch (cause) { setError(cause instanceof Error ? cause.message : "구간을 생성하지 못했습니다."); }
     finally { setIsLoading(false); }
-  };
+  }, []);
 
-  const selectPoint = async (point: RoutePoint) => {
+  const selectPoint = useCallback(async (point: RoutePoint) => {
     if (!start) { setStart(await reverseGeocode(point, "구간 시작점")); setEnd(null); setRoute([]); setDistanceKm(null); return; }
     if (!end) { const location = await reverseGeocode(point, "구간 끝점"); setEnd(location); await requestSegment(start, location); return; }
     setStart(await reverseGeocode(point, "구간 시작점")); setEnd(null); setRoute([]); setDistanceKm(null); setError("");
-  };
+  }, [end, reverseGeocode, requestSegment, start]);
 
   useEffect(() => {
     isLoadingRef.current = isLoading;
@@ -57,7 +57,9 @@ export default function RequiredSegmentPickerModal({ open, initialCenter, onClos
 
   useEffect(() => {
     if (!open) return;
-    setStart(null); setEnd(null); setRoute([]); setDistanceKm(null); setError("");
+    queueMicrotask(() => {
+      if (!cancelled) { setStart(null); setEnd(null); setRoute([]); setDistanceKm(null); setError(""); }
+    });
     let cancelled = false;
     const initialize = async () => {
       try {
@@ -76,7 +78,7 @@ export default function RequiredSegmentPickerModal({ open, initialCenter, onClos
       } catch (cause) { setError(cause instanceof Error ? cause.message : "카카오 지도를 불러오지 못했습니다."); }
     };
     void initialize();
-    return () => { cancelled = true; mapRef.current = null; overlaysRef.current = []; };
+    return () => { cancelled = true; overlaysRef.current.forEach((overlay) => overlay.setMap(null)); mapRef.current = null; overlaysRef.current = []; };
   }, [open, initialCenter]);
 
   useEffect(() => {

@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
+import { validateRequiredSegmentGeometry } from "@/lib/required-segment";
+import { createRouteIndex, haversineMeters, projectPointToRouteProgress } from "@/lib/navigation";
 
 type RoutePoint = {
   latitude: number;
@@ -46,7 +48,14 @@ type RoutedPath = {
   route: RoutePoint[];
   distanceKm: number;
   durationSeconds: number | null;
+  navigationSteps: NavigationStep[];
   overlapMetrics?: OverlapMetrics;
+};
+
+type NavigationStep = {
+  progressMeters: number;
+  distanceMeters: number;
+  guidance: string;
 };
 
 type OverlapMetrics = {
@@ -61,6 +70,7 @@ type BuiltRequiredPath = {
   distanceKm: number;
   durationSeconds: number | null;
   current: RoutePoint;
+  navigationSteps: NavigationStep[];
 };
 
 type KakaoWalkResponse = {
@@ -72,6 +82,13 @@ type KakaoWalkResponse = {
     };
     legs?: {
       steps?: {
+        properties?: {
+          distance?: number;
+          guidance?: string;
+          time?: number;
+          x?: number;
+          y?: number;
+        };
         path?: {
           points?: number[][];
         };
@@ -145,6 +162,11 @@ const MAX_OVERLAP_RATIO = 0.18;
 const EARLY_ACCEPT_OVERLAP_RATIO = 0.08;
 
 const MAX_LOCAL_RADIUS_M = 20_000;
+const MAX_REQUIRED_ITEMS = 8;
+const MAX_REQUIRED_SEGMENT_POINTS = 1_500;
+const KAKAO_REQUEST_TIMEOUT_MS = 12_000;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_REQUESTS = 8;
 
 /*
  * 같은 지역/경관을 반복 생성할 때 Kakao Local API 재호출을 줄인다.
@@ -170,6 +192,34 @@ type LocalCacheEntry = {
 };
 
 const localSearchCache = new Map<string, LocalCacheEntry>();
+const requestRateLimits = new Map<string, { count: number; resetAt: number }>();
+
+/*
+ * Best-effort in-process limiter only. Vercel serverless instances do not share
+ * this memory, so production-wide enforcement requires a shared store (e.g. Redis).
+ */
+
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+function getClientKey(request: NextRequest) {
+  return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+}
+
+function isRateLimited(request: NextRequest) {
+  const key = getClientKey(request);
+  const now = Date.now();
+  const entry = requestRateLimits.get(key);
+  if (!entry || entry.resetAt <= now) {
+    requestRateLimits.set(key, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return false;
+  }
+  entry.count += 1;
+  return entry.count > RATE_LIMIT_MAX_REQUESTS;
+}
 
 function validPoint(point?: RoutePoint | null) {
   return Boolean(
@@ -183,12 +233,39 @@ function validPoint(point?: RoutePoint | null) {
   );
 }
 
+function validRequiredItems(items: unknown): items is RequiredItem[] {
+  if (!Array.isArray(items) || items.length > MAX_REQUIRED_ITEMS) return false;
+  return items.every((item) => {
+    if (!item || typeof item !== "object") return false;
+    const candidate = item as Partial<RequiredItem>;
+    if (candidate.type === "waypoint") return validPoint(candidate.location);
+    if (candidate.type !== "segment") return false;
+    return (
+      validPoint(candidate.start) &&
+      validPoint(candidate.end) &&
+      Array.isArray(candidate.route) &&
+      candidate.route.length >= 2 &&
+      candidate.route.length <= MAX_REQUIRED_SEGMENT_POINTS &&
+      candidate.route.every(validPoint) &&
+      typeof candidate.distanceKm === "number" &&
+      Number.isFinite(candidate.distanceKm) &&
+      candidate.distanceKm > 0
+    );
+  });
+}
+
 function samePoint(a: RoutePoint, b: RoutePoint) {
   const tolerance = 1e-7;
 
   return (
     Math.abs(a.latitude - b.latitude) < tolerance && Math.abs(a.longitude - b.longitude) < tolerance
   );
+}
+
+function validateRequiredSegmentRoute(item: RequiredSegment) {
+  const result = validateRequiredSegmentGeometry(item);
+  if (!result.valid) throw new ApiError(result.message, 400);
+  return result.distanceKm;
 }
 
 function appendRoute(target: RoutePoint[], additional: RoutePoint[]) {
@@ -219,15 +296,37 @@ function addDuration(current: number | null, additional: number | null) {
   return current + additional;
 }
 
+function offsetNavigationSteps(steps: NavigationStep[], offsetMeters: number) {
+  return steps.map((step) => ({ ...step, progressMeters: step.progressMeters + offsetMeters }));
+}
+
+function routeGeometryMeters(route: RoutePoint[]) {
+  let meters = 0;
+  for (let index = 1; index < route.length; index += 1) meters += haversineMeters(route[index - 1], route[index]);
+  return meters;
+}
+
 function parseKakaoRoute(data: KakaoWalkResponse): RoutedPath {
   if (data.status !== "OK" || !data.route) {
     throw new Error(`카카오 도보 경로를 찾지 못했습니다. status=${data.status ?? "UNKNOWN"}`);
   }
 
   const route: RoutePoint[] = [];
+  const rawNavigationSteps: Array<NavigationStep & { anchor?: RoutePoint }> = [];
+  let fallbackProgressMeters = 0;
 
   for (const leg of data.route.legs ?? []) {
     for (const step of leg.steps ?? []) {
+      const stepDistance = step.properties?.distance;
+      const guidance = step.properties?.guidance;
+      const firstPathPoint = step.path?.points?.[0];
+      const anchorLongitude = Number(step.properties?.x ?? firstPathPoint?.[0]);
+      const anchorLatitude = Number(step.properties?.y ?? firstPathPoint?.[1]);
+      const anchor = Number.isFinite(anchorLatitude) && Number.isFinite(anchorLongitude) ? { latitude: anchorLatitude, longitude: anchorLongitude } : undefined;
+      if (typeof stepDistance === "number" && Number.isFinite(stepDistance) && stepDistance > 0 && typeof guidance === "string" && guidance.trim()) {
+        rawNavigationSteps.push({ progressMeters: fallbackProgressMeters, distanceMeters: stepDistance, guidance: guidance.trim(), anchor });
+      }
+      if (typeof stepDistance === "number" && Number.isFinite(stepDistance) && stepDistance > 0) fallbackProgressMeters += stepDistance;
       for (const point of step.path?.points ?? []) {
         if (!Array.isArray(point) || point.length < 2) {
           continue;
@@ -265,11 +364,19 @@ function parseKakaoRoute(data: KakaoWalkResponse): RoutedPath {
   }
 
   const totalTime = data.route.properties?.totalTime;
+  const routeIndex = createRouteIndex(route);
+  const navigationSteps = rawNavigationSteps.flatMap(({ anchor, ...step }) => {
+    if (!anchor) return [step];
+    const projection = projectPointToRouteProgress(routeIndex, anchor);
+    if (!projection || projection.distanceMeters > 80) return [step];
+    return [{ ...step, progressMeters: projection.progressMeters }];
+  }).sort((a, b) => a.progressMeters - b.progressMeters);
 
   return {
     route,
     distanceKm: distanceMeters / 1000,
     durationSeconds: typeof totalTime === "number" && Number.isFinite(totalTime) ? totalTime : null,
+    navigationSteps,
   };
 }
 
@@ -312,6 +419,7 @@ async function requestKakaoChunk(points: RoutePoint[], apiKey: string): Promise<
       Authorization: `KakaoAK ${apiKey}`,
     },
     cache: "no-store",
+    signal: AbortSignal.timeout(KAKAO_REQUEST_TIMEOUT_MS),
   });
 
   const text = await response.text();
@@ -321,13 +429,13 @@ async function requestKakaoChunk(points: RoutePoint[], apiKey: string): Promise<
   try {
     data = JSON.parse(text) as KakaoWalkResponse;
   } catch {
-    console.log("Kakao raw response:", text);
+    console.error("Kakao walking response parse failed", { responseLength: text.length });
     throw new Error("카카오 API 응답을 해석하지 못했습니다.");
   }
 
   if (!response.ok) {
-    console.log("Kakao walking HTTP error:", response.status, data);
-    throw new Error(`카카오 도보 API 오류: HTTP ${response.status}`);
+    console.error("Kakao walking HTTP error", { status: response.status, category: data.status ?? "unknown" });
+    throw new ApiError(`카카오 도보 API 오류: HTTP ${response.status}`, response.status === 429 ? 429 : 502);
   }
 
   return parseKakaoRoute(data);
@@ -379,6 +487,7 @@ async function requestPedestrianRoute(points: RoutePoint[]): Promise<RoutedPath>
       route,
       distanceKm: first.distanceKm + second.distanceKm,
       durationSeconds: addDuration(first.durationSeconds, second.durationSeconds),
+      navigationSteps: [...first.navigationSteps, ...offsetNavigationSteps(second.navigationSteps, routeGeometryMeters(first.route))],
     };
   }
 
@@ -389,6 +498,7 @@ async function requestPedestrianRoute(points: RoutePoint[]): Promise<RoutedPath>
     const completeRoute: RoutePoint[] = [];
     let totalDistanceKm = 0;
     let totalDurationSeconds: number | null = 0;
+    const navigationSteps: NavigationStep[] = [];
 
     let index = 0;
 
@@ -397,9 +507,11 @@ async function requestPedestrianRoute(points: RoutePoint[]): Promise<RoutedPath>
       const chunk = normalized.slice(index, endIndex + 1);
       const routed = await requestKakaoChunk(chunk, apiKey);
 
+      const navigationOffsetMeters = routeGeometryMeters(completeRoute);
       appendRoute(completeRoute, routed.route);
       totalDistanceKm += routed.distanceKm;
       totalDurationSeconds = addDuration(totalDurationSeconds, routed.durationSeconds);
+      navigationSteps.push(...offsetNavigationSteps(routed.navigationSteps, navigationOffsetMeters));
 
       index = endIndex;
     }
@@ -408,6 +520,7 @@ async function requestPedestrianRoute(points: RoutePoint[]): Promise<RoutedPath>
       route: completeRoute,
       distanceKm: totalDistanceKm,
       durationSeconds: totalDurationSeconds,
+      navigationSteps,
     };
   }
 
@@ -421,6 +534,7 @@ async function buildRequiredPath(
   const completeRoute: RoutePoint[] = [];
   let totalDistanceKm = 0;
   let totalDurationSeconds: number | null = 0;
+  const navigationSteps: NavigationStep[] = [];
   let current = start;
   let pendingPoints: RoutePoint[] = [current];
 
@@ -431,9 +545,11 @@ async function buildRequiredPath(
 
     const routed = await requestPedestrianRoute(pendingPoints);
 
+    const navigationOffsetMeters = routeGeometryMeters(completeRoute);
     appendRoute(completeRoute, routed.route);
     totalDistanceKm += routed.distanceKm;
     totalDurationSeconds = addDuration(totalDurationSeconds, routed.durationSeconds);
+    navigationSteps.push(...offsetNavigationSteps(routed.navigationSteps, navigationOffsetMeters));
 
     current = pendingPoints[pendingPoints.length - 1];
     pendingPoints = [current];
@@ -465,7 +581,7 @@ async function buildRequiredPath(
 
     /* 사용자가 선택한 필수 구간은 그대로 삽입한다. */
     appendRoute(completeRoute, item.route);
-    totalDistanceKm += item.distanceKm;
+    totalDistanceKm += validateRequiredSegmentRoute(item);
     totalDurationSeconds = null;
     current = item.end;
     pendingPoints = [current];
@@ -482,6 +598,7 @@ async function buildRequiredPath(
     distanceKm: totalDistanceKm,
     durationSeconds: totalDurationSeconds,
     current,
+    navigationSteps,
   };
 }
 
@@ -729,6 +846,7 @@ async function searchKakaoKeyword(
         Authorization: `KakaoAK ${apiKey}`,
       },
       cache: "no-store",
+      signal: AbortSignal.timeout(KAKAO_REQUEST_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -1039,6 +1157,7 @@ async function generateOneWay(
     route: completeRoute,
     distanceKm: requiredPath.distanceKm + finalLeg.distanceKm,
     durationSeconds: addDuration(requiredPath.durationSeconds, finalLeg.durationSeconds),
+    navigationSteps: [...requiredPath.navigationSteps, ...offsetNavigationSteps(finalLeg.navigationSteps, routeGeometryMeters(requiredPath.route))],
   };
 }
 
@@ -1054,6 +1173,7 @@ async function generateOutAndBack(
     route: [...outbound.route, ...returnRoute],
     distanceKm: outbound.distanceKm * 2,
     durationSeconds: outbound.durationSeconds === null ? null : outbound.durationSeconds * 2,
+    navigationSteps: outbound.navigationSteps,
   };
 }
 
@@ -1073,6 +1193,7 @@ async function generateLoop(
           distanceKm: 0,
           durationSeconds: 0,
           current: start,
+          navigationSteps: [],
         };
 
   let directHome: RoutedPath | null = null;
@@ -1099,6 +1220,7 @@ async function generateLoop(
         route: completeRoute,
         distanceKm: minimumDistance,
         durationSeconds: addDuration(requiredPath.durationSeconds, directHome.durationSeconds),
+        navigationSteps: [...requiredPath.navigationSteps, ...offsetNavigationSteps(directHome.navigationSteps, routeGeometryMeters(requiredPath.route))],
         overlapMetrics,
       };
     }
@@ -1179,6 +1301,7 @@ async function generateLoop(
         route: completeRoute,
         distanceKm: totalDistanceKm,
         durationSeconds: addDuration(requiredPath.durationSeconds, tail.durationSeconds),
+        navigationSteps: [...requiredPath.navigationSteps, ...offsetNavigationSteps(tail.navigationSteps, routeGeometryMeters(requiredPath.route))],
         overlapMetrics,
       },
       totalDistanceKm,
@@ -1215,6 +1338,7 @@ async function generateLoop(
         route: completeRoute,
         distanceKm: requiredPath.distanceKm + directHome.distanceKm,
         durationSeconds: addDuration(requiredPath.durationSeconds, directHome.durationSeconds),
+        navigationSteps: [...requiredPath.navigationSteps, ...offsetNavigationSteps(directHome.navigationSteps, routeGeometryMeters(requiredPath.route))],
         overlapMetrics,
       };
     }
@@ -1264,16 +1388,35 @@ export async function POST(request: NextRequest) {
   const requestStartedAt = Date.now();
 
   try {
-    const body = (await request.json()) as RouteRequestBody;
+    if (isRateLimited(request)) {
+      return NextResponse.json({ error: "잠시 후 다시 시도해주세요." }, { status: 429 });
+    }
+
+    let body: RouteRequestBody;
+    try {
+      body = (await request.json()) as RouteRequestBody;
+    } catch {
+      return NextResponse.json({ error: "JSON 요청 본문이 필요합니다." }, { status: 400 });
+    }
+
+    if (!body || typeof body !== "object") {
+      return NextResponse.json({ error: "올바른 요청 본문이 필요합니다." }, { status: 400 });
+    }
 
     const {
       routeType,
       start,
       destination,
       targetDistanceKm,
-      requiredItems = [],
-      preferences = {},
+      requiredItems,
+      preferences,
     } = body;
+
+    if (!validRequiredItems(requiredItems ?? [])) {
+      return NextResponse.json({ error: `필수 조건은 최대 ${MAX_REQUIRED_ITEMS}개까지, 올바른 좌표로 입력해주세요.` }, { status: 400 });
+    }
+    const safeRequiredItems = requiredItems ?? [];
+    const safePreferences: RoutePreferences = preferences && typeof preferences === "object" ? preferences : {};
 
     if (!validPoint(start)) {
       return NextResponse.json(
@@ -1326,7 +1469,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    for (const item of requiredItems) {
+    for (const item of safeRequiredItems) {
       if (item.type === "waypoint") {
         if (!validPoint(item.location)) {
           return NextResponse.json(
@@ -1366,11 +1509,11 @@ export async function POST(request: NextRequest) {
     let result: RoutedPath;
 
     if (routeType === "순환형") {
-      result = await generateLoop(start, targetDistanceKm!, requiredItems, preferences);
+      result = await generateLoop(start, targetDistanceKm!, safeRequiredItems, safePreferences);
     } else if (routeType === "왕복형") {
-      result = await generateOutAndBack(start, destination!, requiredItems);
+      result = await generateOutAndBack(start, destination!, safeRequiredItems);
     } else {
-      result = await generateOneWay(start, destination!, requiredItems);
+      result = await generateOneWay(start, destination!, safeRequiredItems);
     }
 
     const distanceErrorKm = routeType === "순환형" ? result.distanceKm - targetDistanceKm! : null;
@@ -1380,20 +1523,21 @@ export async function POST(request: NextRequest) {
 
     const unsupportedPreferences: string[] = [];
 
-    if (preferences.elevation?.min !== null && preferences.elevation?.min !== undefined) {
+    if (safePreferences.elevation?.min !== null && safePreferences.elevation?.min !== undefined) {
       unsupportedPreferences.push("elevationMin");
     }
 
-    if (preferences.elevation?.max !== null && preferences.elevation?.max !== undefined) {
+    if (safePreferences.elevation?.max !== null && safePreferences.elevation?.max !== undefined) {
       unsupportedPreferences.push("elevationMax");
     }
 
-    if (preferences.signalPreference && preferences.signalPreference !== "상관없음") {
+    if (safePreferences.signalPreference && safePreferences.signalPreference !== "상관없음") {
       unsupportedPreferences.push("signalPreference");
     }
 
     return NextResponse.json({
       route: result.route,
+      navigationSteps: result.navigationSteps,
       summary: {
         targetDistanceKm: routeType === "순환형" ? targetDistanceKm : null,
         distanceKm: result.distanceKm,
@@ -1411,20 +1555,20 @@ export async function POST(request: NextRequest) {
         provider: "kakao",
         planner: "perog-kakao-only",
         scenerySource: "kakao-local-poi",
-        requiredItemsCount: requiredItems.length,
+        requiredItemsCount: safeRequiredItems.length,
         unsupportedPreferences,
         generationMs: Date.now() - requestStartedAt,
       },
     });
   } catch (error) {
-    console.log("PEROG Kakao-only route API error:", error);
+    console.error("PEROG Kakao-only route API error:", error instanceof Error ? error.message : "unknown");
 
     return NextResponse.json(
       {
         error: error instanceof Error ? error.message : "경로 생성 중 서버 오류가 발생했습니다.",
       },
       {
-        status: 500,
+        status: error instanceof ApiError ? error.status : error instanceof DOMException && error.name === "TimeoutError" ? 504 : 500,
       }
     );
   }

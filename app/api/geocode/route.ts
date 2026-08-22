@@ -12,6 +12,7 @@ type KakaoPlace = {
 type KakaoKeywordResponse = { documents?: KakaoPlace[] };
 
 const KAKAO_KEYWORD_URL = "https://dapi.kakao.com/v2/local/search/keyword.json";
+const KAKAO_REQUEST_TIMEOUT_MS = 8_000;
 
 function finiteCoordinate(value: string | null, min: number, max: number) {
   const number = Number(value);
@@ -47,6 +48,7 @@ export async function GET(request: NextRequest) {
     const response = await fetch(`${KAKAO_KEYWORD_URL}?${params.toString()}`, {
       headers: { Authorization: `KakaoAK ${apiKey}` },
       cache: "no-store",
+      signal: AbortSignal.timeout(KAKAO_REQUEST_TIMEOUT_MS),
     });
 
     if (!response.ok) {

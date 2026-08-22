@@ -30,6 +30,7 @@ type KakaoWalkResponse = {
 };
 
 const KAKAO_WALK_URL = "https://dapi.kakao.com/v2/routing/walk";
+const KAKAO_REQUEST_TIMEOUT_MS = 12_000;
 
 function validPoint(point: RoutePoint | undefined) {
   return Boolean(
@@ -149,6 +150,7 @@ export async function POST(request: NextRequest) {
       },
 
       cache: "no-store",
+      signal: AbortSignal.timeout(KAKAO_REQUEST_TIMEOUT_MS),
     });
 
     /*

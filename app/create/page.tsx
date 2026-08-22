@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import dynamic from "next/dynamic";
 import Header from "@/components/layout/Header";
+import { useCurrentUser } from "@/components/auth/useCurrentUser";
 import { useRouter } from "next/navigation";
 
 const RouteMap = dynamic(() => import("@/components/map/RouteMap"), { ssr: false });
@@ -73,6 +74,7 @@ type LocationTarget =
 
 type RouteApiResponse = {
   route?: RoutePoint[];
+  navigationSteps?: { progressMeters: number; distanceMeters: number; guidance: string }[];
 
   summary?: {
     targetDistanceKm?: number | null;
@@ -82,6 +84,7 @@ type RouteApiResponse = {
     durationSeconds?: number | null;
     routeType?: RouteType;
     costing?: string;
+    overlapRatio?: number | null;
   };
 
   error?: string;
@@ -113,6 +116,7 @@ async function readJsonResponse(response: Response) {
 
 export default function CreatePage() {
   const router = useRouter();
+  const auth = useCurrentUser();
   /*
    * ==================================================
    * 기본 설정
@@ -193,12 +197,31 @@ export default function CreatePage() {
    */
 
   const [generatedRoute, setGeneratedRoute] = useState<RoutePoint[] | null>(null);
+  const [navigationSteps, setNavigationSteps] = useState<{ progressMeters: number; distanceMeters: number; guidance: string }[]>([]);
 
   const [actualDistance, setActualDistance] = useState<number | null>(null);
 
   const [distanceErrorPercent, setDistanceErrorPercent] = useState<number | null>(null);
 
   const [isGenerating, setIsGenerating] = useState(false);
+  const [savedRouteId, setSavedRouteId] = useState<string | null>(null);
+  const [isSavingRoute, setIsSavingRoute] = useState(false);
+
+  useEffect(() => {
+    if (auth.status !== "authenticated") return;
+    let active = true;
+    void fetch("/api/settings", { cache: "no-store" })
+      .then((response) => response.ok ? response.json() as Promise<{ preferences?: { preferredRouteTypes?: string[]; preferredSceneries?: string[]; defaultDistanceKm?: number | null } }> : null)
+      .then((data) => {
+        if (!active || !data?.preferences) return;
+        if (data.preferences.defaultDistanceKm) setDistanceInput((current) => current || String(data.preferences?.defaultDistanceKm));
+        if (data.preferences.preferredSceneries?.length) setSceneries((current) => current.length === 0 ? data.preferences?.preferredSceneries ?? current : current);
+        const preferredType = data.preferences.preferredRouteTypes?.[0];
+        if (preferredType === "순환형" || preferredType === "왕복형" || preferredType === "편도형") setRouteType((current) => current ?? preferredType);
+      })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, [auth.status]);
 
   /*
    * ==================================================
@@ -208,8 +231,10 @@ export default function CreatePage() {
 
   const clearGeneratedRoute = () => {
     setGeneratedRoute(null);
+    setNavigationSteps([]);
     setActualDistance(null);
     setDistanceErrorPercent(null);
+    setSavedRouteId(null);
   };
 
   /*
@@ -220,10 +245,12 @@ export default function CreatePage() {
 
   useEffect(() => {
     if (!searchTarget || searchQuery.trim().length < 2) {
-      setSearchResults([]);
-      return;
+      const clearTimer = window.setTimeout(() => setSearchResults([]), 0);
+      return () => window.clearTimeout(clearTimer);
     }
 
+    const controller = new AbortController();
+    let active = true;
     const timer = window.setTimeout(async () => {
       try {
         setIsSearching(true);
@@ -237,26 +264,31 @@ export default function CreatePage() {
           params.set("lon", String(locationA.longitude));
         }
 
-        const response = await fetch(`/api/geocode?${params.toString()}`);
+        const response = await fetch(`/api/geocode?${params.toString()}`, { signal: controller.signal });
 
         const data = await readJsonResponse(response);
 
         if (!response.ok) {
-          setSearchResults([]);
+          if (active) setSearchResults([]);
           return;
         }
 
-        setSearchResults(data.results ?? []);
+        if (active) setSearchResults(data.results ?? []);
       } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
         console.error("Place search failed:", error);
 
-        setSearchResults([]);
+        if (active) setSearchResults([]);
       } finally {
-        setIsSearching(false);
+        if (active) setIsSearching(false);
       }
     }, 350);
 
-    return () => window.clearTimeout(timer);
+    return () => {
+      active = false;
+      controller.abort();
+      window.clearTimeout(timer);
+    };
   }, [searchQuery, searchTarget, locationA]);
 
   /*
@@ -566,6 +598,7 @@ export default function CreatePage() {
       }
 
       setGeneratedRoute(data.route);
+      setNavigationSteps(data.navigationSteps ?? []);
 
       setActualDistance(data.summary?.distanceKm ?? null);
 
@@ -578,6 +611,41 @@ export default function CreatePage() {
       alert(error instanceof Error ? error.message : "경로 생성 중 오류가 발생했습니다.");
     } finally {
       setIsGenerating(false);
+    }
+  };
+
+  const saveRoute = async () => {
+    if (!generatedRoute || !routeType || actualDistance === null || isSavingRoute) return;
+    setIsSavingRoute(true);
+    try {
+      const response = await fetch("/api/routes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          routeType,
+          start: locationA,
+          destination: locationB,
+          route: generatedRoute,
+          navigationSteps,
+          targetDistanceKm: routeType === "순환형" ? Number(distanceInput) : null,
+          preferences: { sceneries, signalPreference, elevation: { min: minElevationInput === "" ? null : Number(minElevationInput), max: maxElevationInput === "" ? null : Number(maxElevationInput) } },
+          requiredItems,
+          summary: {
+            distanceMeters: Math.round(actualDistance * 1_000),
+            targetDistanceMeters: routeType === "순환형" && distanceInput ? Number(distanceInput) * 1_000 : null,
+            distanceErrorPercent,
+            durationSeconds: null,
+            overlapRatio: null,
+          },
+        }),
+      });
+      const data = await readJsonResponse(response) as { route?: { id?: string }; error?: string };
+      if (!response.ok || !data.route?.id) throw new Error(data.error ?? "경로를 저장하지 못했습니다.");
+      setSavedRouteId(data.route.id);
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "경로를 저장하지 못했습니다.");
+    } finally {
+      setIsSavingRoute(false);
     }
   };
 
@@ -601,6 +669,8 @@ export default function CreatePage() {
         distanceKm: actualDistance,
         start: locationA,
         destination: locationB,
+        navigationSteps,
+        routeId: savedRouteId,
       })
     );
 
@@ -1194,16 +1264,16 @@ export default function CreatePage() {
             />
 
             {generatedRoute && generatedRoute.length > 1 && (
-              <button className="start-navigation-button" type="button" onClick={startNavigation}>
-                <span className="start-navigation-button__icon">▶</span>
-
-                <span className="start-navigation-button__text">
-                  <strong>내비게이션 시작</strong>
-                  <small>실시간 경로 안내</small>
-                </span>
-
-                <span className="start-navigation-button__arrow">→</span>
-              </button>
+              <>
+                <button className="start-navigation-button" type="button" onClick={startNavigation}>
+                  <span className="start-navigation-button__icon">▶</span>
+                  <span className="start-navigation-button__text"><strong>내비게이션 시작</strong><small>실시간 경로 안내</small></span>
+                  <span className="start-navigation-button__arrow">→</span>
+                </button>
+                <div className="route-save-action">
+                  {auth.status === "authenticated" ? savedRouteId ? <span>✓ 내 경로에 저장됨</span> : <button type="button" onClick={saveRoute} disabled={isSavingRoute}>{isSavingRoute ? "저장 중..." : "내 경로에 저장"}</button> : auth.status === "guest" ? <><span>로그인하면 이 경로를 저장할 수 있습니다.</span><a href="/api/auth/kakao?returnTo=/create">카카오로 로그인</a></> : null}
+                </div>
+              </>
             )}
 
             <div className="route-preview-summary">

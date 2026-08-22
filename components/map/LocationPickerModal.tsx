@@ -14,6 +14,7 @@ export default function LocationPickerModal({ open, mode, targetLabel, initialCe
   const selectPointRef = useRef<(latitude: number, longitude: number) => Promise<void>>(async () => {});
   const manualSelectionRef = useRef(false);
   const isLoadingRef = useRef(false);
+  const requestIdRef = useRef(0);
   const [selectedLocation, setSelectedLocation] = useState<SelectedLocation | null>(null);
   const [manualSelection, setManualSelection] = useState(mode === "map");
   const [isLoading, setIsLoading] = useState(false);
@@ -27,17 +28,21 @@ export default function LocationPickerModal({ open, mode, targetLabel, initialCe
   }, []);
 
   const selectPoint = useCallback(async (latitude: number, longitude: number) => {
+    const requestId = ++requestIdRef.current;
     setIsLoading(true);
     setErrorMessage("");
     setSelectedLocation({ latitude, longitude, name: "주소 확인 중...", address: "선택한 위치의 주소를 확인하고 있습니다." });
     try {
-      setSelectedLocation(await resolveAddress(latitude, longitude));
+      const resolved = await resolveAddress(latitude, longitude);
+      if (requestId !== requestIdRef.current) return;
+      setSelectedLocation(resolved);
     } catch (error) {
+      if (requestId !== requestIdRef.current) return;
       console.error("Kakao reverse geocode failed:", error);
       setSelectedLocation({ latitude, longitude, name: "선택한 위치", address: "주소 정보를 불러오지 못했습니다." });
       setErrorMessage("주소 정보를 불러오지 못했습니다.");
     } finally {
-      setIsLoading(false);
+      if (requestId === requestIdRef.current) setIsLoading(false);
     }
   }, [resolveAddress]);
 
@@ -53,8 +58,13 @@ export default function LocationPickerModal({ open, mode, targetLabel, initialCe
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    setSelectedLocation(null);
-    setErrorMessage("");
+    queueMicrotask(() => {
+      if (!cancelled) {
+        requestIdRef.current += 1;
+        setSelectedLocation(null);
+        setErrorMessage("");
+      }
+    });
     const initialize = async () => {
       try {
         const maps = await loadKakaoMapsSdk();
@@ -74,7 +84,7 @@ export default function LocationPickerModal({ open, mode, targetLabel, initialCe
       }
     };
     void initialize();
-    return () => { cancelled = true; mapRef.current = null; markerRef.current = null; };
+    return () => { cancelled = true; requestIdRef.current += 1; markerRef.current?.setMap(null); mapRef.current = null; markerRef.current = null; };
   }, [open, initialCenter]);
 
   useEffect(() => {
@@ -94,15 +104,20 @@ export default function LocationPickerModal({ open, mode, targetLabel, initialCe
 
   useEffect(() => {
     if (!open) return;
-    if (mode === "map") { setManualSelection(true); return; }
-    setManualSelection(false);
-    if (!navigator.geolocation) { setErrorMessage("현재 위치 기능을 사용할 수 없습니다."); setManualSelection(true); return; }
-    setIsLoading(true);
-    navigator.geolocation.getCurrentPosition(
-      (position) => { void selectPoint(position.coords.latitude, position.coords.longitude); },
-      () => { setIsLoading(false); setErrorMessage("현재 위치를 가져오지 못했습니다. 지도에서 직접 선택해주세요."); setManualSelection(true); },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-    );
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      if (mode === "map") { setManualSelection(true); return; }
+      setManualSelection(false);
+      if (!navigator.geolocation) { setErrorMessage("현재 위치 기능을 사용할 수 없습니다."); setManualSelection(true); return; }
+      setIsLoading(true);
+      navigator.geolocation.getCurrentPosition(
+        (position) => { if (!cancelled) void selectPoint(position.coords.latitude, position.coords.longitude); },
+        () => { if (!cancelled) { setIsLoading(false); setErrorMessage("현재 위치를 가져오지 못했습니다. 지도에서 직접 선택해주세요."); setManualSelection(true); } },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      );
+    });
+    return () => { cancelled = true; };
   }, [open, mode, selectPoint]);
 
   if (!open) return null;

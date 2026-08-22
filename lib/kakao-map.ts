@@ -52,5 +52,8 @@ export function loadKakaoMapsSdk(): Promise<typeof kakao.maps> {
     document.head.appendChild(script);
   });
 
-  return sdkPromise;
+  return sdkPromise.catch((error: unknown) => {
+    sdkPromise = null;
+    throw error;
+  });
 }
