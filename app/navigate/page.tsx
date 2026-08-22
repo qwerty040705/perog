@@ -3,7 +3,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import NavigationMiniMap from "@/components/map/NavigationMiniMap";
+import { NavigationConfirmModal } from "@/components/navigation/NavigationConfirmModal";
 import { bearingDegrees, circularEma, createRouteIndex, findUpcomingNavigationStep, findUpcomingTurn, findUpcomingTurns, haversineMeters, isFreshTimestamp, matchRoute, normalizeAngle, pointAtDistance, selectMovementHeading, updateArrivalSampleCount, type NavigationStep, type RouteMatch, type RoutePoint } from "@/lib/navigation";
+import { cancelNavigationLeave, confirmNavigationLeave, initialNavigationLeaveGuardState, requestNavigationLeave, shouldGuardNavigationLeave, type NavigationLeaveGuardState, type NavigationLeaveTarget } from "@/lib/navigation-leave-guard";
 import { appendWorkoutTrackPoint, createWorkoutSession, createWorkoutSummary, elapsedWorkoutSeconds, pauseWorkout, recordOffRouteTransition, resumeWorkout, selectRecoveryTarget, type WorkoutSession, type WorkoutTrackPoint } from "@/lib/workout";
 import { activeWorkoutToSession, clearActiveWorkout, createActiveWorkout, isActiveWorkoutStale, loadActiveWorkout, saveActiveWorkout, type ActiveWorkoutState } from "@/lib/active-workout";
 import { useCurrentUser } from "@/components/auth/useCurrentUser";
@@ -23,6 +25,7 @@ type DebugSample = {
   progressMeters: number | null; routeDistanceError: number | null; targetBearing: number | null; headingDifference: number | null;
   turnType: TurnType | null; turnDistance: number | null; isOffRoute: boolean; routeLost: boolean;
 };
+type HistoryGuard = { marker: string; installed: boolean };
 
 const STRAIGHT_LOOK_AHEAD_METERS = 35;
 const FINISH_THRESHOLD_METERS = 15;
@@ -39,11 +42,16 @@ const PACE_EMA_ALPHA = 0.25;
 const RECOVERY_PROMPT_AFTER_MS = 10_000;
 const DEBUG_LOG_LIMIT = 3_000;
 const WORKOUT_SUMMARY_STORAGE_KEY = "perog-last-workout";
+const CAN_SHOW_DEBUG_CONTROLS = process.env.NODE_ENV === "development";
 
 function validRoutePoint(value: unknown): value is RoutePoint {
   if (!value || typeof value !== "object") return false;
   const point = value as Partial<RoutePoint>;
   return typeof point.latitude === "number" && typeof point.longitude === "number" && Number.isFinite(point.latitude) && Number.isFinite(point.longitude) && point.latitude >= -90 && point.latitude <= 90 && point.longitude >= -180 && point.longitude <= 180;
+}
+
+function recordFromUnknown(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
 }
 
 function parseNavigationData(value: string): NavigationData {
@@ -112,6 +120,12 @@ export default function NavigatePage() {
   const arrivalDismissedRef = useRef(false);
   const restorePendingRef = useRef<ActiveWorkoutState | null>(null);
   const navigationDataRef = useRef<NavigationData | null>(null);
+  const isFinalizingRef = useRef(false);
+  const leaveGuardRef = useRef<NavigationLeaveGuardState>(initialNavigationLeaveGuardState);
+  const requestNavigationRef = useRef<(target: NavigationLeaveTarget) => void>(() => undefined);
+  const historyGuardRef = useRef<HistoryGuard | null>(null);
+  const browserBackBypassRef = useRef(false);
+  const browserHistoryRestoreRef = useRef(false);
   const [navigationData, setNavigationData] = useState<NavigationData | null>(null);
   const [legacyNavigationData, setLegacyNavigationData] = useState<NavigationData | null>(null);
   const [activeWorkoutRecovery, setActiveWorkoutRecovery] = useState<ActiveWorkoutState | null>(null);
@@ -141,6 +155,8 @@ export default function NavigatePage() {
   const [recoveryLoading, setRecoveryLoading] = useState(false);
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const [showEndConfirm, setShowEndConfirm] = useState(false);
+  const [leaveGuard, setLeaveGuard] = useState<NavigationLeaveGuardState>(initialNavigationLeaveGuardState);
+  const [showSettings, setShowSettings] = useState(false);
   const [showArrivalPrompt, setShowArrivalPrompt] = useState(false);
   const [workoutDistanceMeters, setWorkoutDistanceMeters] = useState(0);
   const [recoveryPromptVisible, setRecoveryPromptVisible] = useState(false);
@@ -193,8 +209,51 @@ export default function NavigatePage() {
       .then((response) => { if (!response.ok) throw new Error(); setServerSyncError(false); })
       .catch(() => setServerSyncError(true));
   };
+
+  const updateLeaveGuard = (next: NavigationLeaveGuardState) => {
+    leaveGuardRef.current = next;
+    setLeaveGuard(next);
+  };
+
+  const executeLeaveTarget = (target: NavigationLeaveTarget) => {
+    if (target.kind === "route") {
+      router.push(target.href);
+      return;
+    }
+    browserBackBypassRef.current = true;
+    window.history.go(target.delta);
+    window.setTimeout(() => { browserBackBypassRef.current = false; }, 700);
+  };
+
+  const requestNavigation = (target: NavigationLeaveTarget) => {
+    const transition = requestNavigationLeave(
+      leaveGuardRef.current,
+      shouldGuardNavigationLeave(navigationData !== null, isFinalizingRef.current),
+      target,
+    );
+    if (transition.action === "none") return;
+    updateLeaveGuard(transition.state);
+    if (transition.action === "leave-now") executeLeaveTarget(target);
+  };
+
+  const cancelLeaveNavigation = () => updateLeaveGuard(cancelNavigationLeave());
+
+  const confirmLeaveNavigation = () => {
+    const transition = confirmNavigationLeave(leaveGuardRef.current);
+    if (transition.action !== "persist-and-leave" || transition.target === null) return;
+    updateLeaveGuard(transition.state);
+    // Local persistence is authoritative for recovery. Server sync is
+    // best-effort and intentionally does not delay the user's navigation.
+    persistActiveWorkout();
+    syncActiveWorkoutToServer(true);
+    executeLeaveTarget(transition.target);
+  };
+
   useEffect(() => {
     syncActiveWorkoutRef.current = syncActiveWorkoutToServer;
+  });
+  useEffect(() => {
+    requestNavigationRef.current = requestNavigation;
   });
 
   useEffect(() => {
@@ -225,6 +284,38 @@ export default function NavigatePage() {
   useEffect(() => { navigationDataRef.current = navigationData; }, [navigationData]);
 
   useEffect(() => {
+    if (!navigationData) return;
+    const state = recordFromUnknown(window.history.state);
+    const knownMarker = typeof state.__perogNavigationGuard === "string" ? state.__perogNavigationGuard : null;
+    const marker = knownMarker ?? `perog-navigation-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    if (!knownMarker) {
+      window.history.replaceState({ ...state, __perogNavigationBase: marker }, "", window.location.href);
+      window.history.pushState({ ...state, __perogNavigationGuard: marker }, "", window.location.href);
+    }
+    historyGuardRef.current = { marker, installed: true };
+
+    const onPopState = () => {
+      if (!shouldGuardNavigationLeave(navigationDataRef.current !== null, isFinalizingRef.current)) return;
+      if (browserBackBypassRef.current) {
+        browserBackBypassRef.current = false;
+        return;
+      }
+      if (browserHistoryRestoreRef.current) {
+        browserHistoryRestoreRef.current = false;
+        return;
+      }
+      // One sentinel entry is restored rather than pushed again, preventing
+      // a back-button loop while the custom confirmation is visible.
+      browserHistoryRestoreRef.current = true;
+      window.history.go(1);
+      requestNavigationRef.current({ kind: "history", delta: -2 });
+    };
+
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [navigationData]);
+
+  useEffect(() => {
     if (auth.status !== "authenticated") return;
     let active = true;
     void fetch("/api/workouts/active", { cache: "no-store" })
@@ -240,19 +331,30 @@ export default function NavigatePage() {
 
   useEffect(() => {
     if (!navigationData) return;
-    const timer = window.setInterval(() => { persistActiveWorkout(); syncActiveWorkoutRef.current(); }, 3_000);
-    const persistOnPageExit = () => { persistActiveWorkout(); syncActiveWorkoutRef.current(true); };
+    const timer = window.setInterval(() => {
+      if (!isFinalizingRef.current) { persistActiveWorkout(); syncActiveWorkoutRef.current(); }
+    }, 3_000);
+    const persistOnPageExit = () => {
+      if (!isFinalizingRef.current) { persistActiveWorkout(); syncActiveWorkoutRef.current(true); }
+    };
     const persistWhenHidden = () => {
       if (document.visibilityState === "hidden") { persistActiveWorkout(); syncActiveWorkoutRef.current(true); }
     };
+    const confirmBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (isFinalizingRef.current) return;
+      persistOnPageExit();
+      event.preventDefault();
+      event.returnValue = "";
+    };
     window.addEventListener("pagehide", persistOnPageExit);
+    window.addEventListener("beforeunload", confirmBeforeUnload);
     document.addEventListener("visibilitychange", persistWhenHidden);
     return () => {
       window.clearInterval(timer);
       window.removeEventListener("pagehide", persistOnPageExit);
+      window.removeEventListener("beforeunload", confirmBeforeUnload);
       document.removeEventListener("visibilitychange", persistWhenHidden);
-      persistActiveWorkout();
-      syncActiveWorkoutRef.current(true);
+      persistOnPageExit();
     };
   }, [auth.status, navigationData]);
 
@@ -285,6 +387,7 @@ export default function NavigatePage() {
 
   useEffect(() => {
     if (!navigationData) return;
+    isFinalizingRef.current = false;
     const restoring = restorePendingRef.current;
     if (restoring) {
       workoutRef.current = activeWorkoutToSession(restoring);
@@ -613,6 +716,7 @@ export default function NavigatePage() {
   const remainingKm = routeLost ? null : navigationState ? navigationState.remainingDistanceMeters / 1000 : navigationData?.distanceKm ?? null;
   const gpsSignal = currentPosition === null ? null : currentPosition.accuracy <= 12 ? "good" : currentPosition.accuracy <= 25 ? "medium" : "weak";
   const compassStatus = orientationFresh ? "READY" : deviceHeading !== null ? "STALE" : "WAITING";
+  const showCompassNotice = !orientationFresh && gpsFallbackHeading === null && currentPosition !== null;
   const nextLabel = hasRouteIssue
     ? "OFF ROUTE"
     : instruction?.type === "finish"
@@ -666,6 +770,7 @@ export default function NavigatePage() {
       router.replace("/create");
       return;
     }
+    isFinalizingRef.current = true;
     const endedAt = Date.now();
     const summary = createWorkoutSummary(
       workout,
@@ -675,7 +780,10 @@ export default function NavigatePage() {
       navigationData.route,
       navigationState?.progressRatio ?? 0
     );
-    if (!saveCompletedWorkout(summary)) return;
+    if (!saveCompletedWorkout(summary)) {
+      isFinalizingRef.current = false;
+      return;
+    }
     if (auth.status === "authenticated") {
       void fetch("/api/workouts/finish", {
         method: "POST",
@@ -699,6 +807,7 @@ export default function NavigatePage() {
   const finishRecoveredWorkout = () => {
     const activeWorkout = activeWorkoutRecovery;
     if (!activeWorkout) return;
+    isFinalizingRef.current = true;
     const summary = createWorkoutSummary(
       activeWorkoutToSession(activeWorkout),
       Date.now(),
@@ -707,7 +816,10 @@ export default function NavigatePage() {
       activeWorkout.route,
       activeWorkout.plannedDistanceMeters > 0 ? activeWorkout.progressMeters / activeWorkout.plannedDistanceMeters : 0
     );
-    if (!saveCompletedWorkout(summary)) return;
+    if (!saveCompletedWorkout(summary)) {
+      isFinalizingRef.current = false;
+      return;
+    }
     if (auth.status === "authenticated") {
       void fetch("/api/workouts/finish", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...summary, sourceWorkoutId: summary.id, plannedRoute: summary.plannedRoute, actualDistanceMeters: summary.distanceMeters }), keepalive: true }).catch(() => setServerSyncError(true));
     }
@@ -792,7 +904,7 @@ export default function NavigatePage() {
       <video ref={videoRef} className="navigation-camera" autoPlay playsInline muted />
       <div className="navigation-overlay">
         <div className="navigation-top">
-          <button className="navigation-back-button" type="button" onClick={() => router.back()} aria-label="내비게이션 닫기">←</button>
+          <button className="navigation-back-button" type="button" onClick={() => requestNavigation({ kind: "history", delta: historyGuardRef.current?.installed ? -2 : -1 })} aria-label="내비게이션 닫기">←</button>
           <div className="navigation-brand"><strong>PEROG</strong><span>LIVE NAVIGATION</span></div>
           {currentPosition && <div className={`navigation-gps navigation-gps--${gpsSignal}`}>GPS ±{Math.round(currentPosition.accuracy)}m</div>}
         </div>
@@ -805,10 +917,8 @@ export default function NavigatePage() {
           </div>
           <button type="button" onClick={togglePause}>{isPaused ? "RESUME" : "PAUSE"}</button>
           <button className="navigation-toolbar__end" type="button" onClick={() => setShowEndConfirm(true)}>END</button>
+          <button type="button" className="navigation-toolbar__settings" onClick={() => setShowSettings((visible) => !visible)} aria-expanded={showSettings} aria-controls="navigation-settings">⚙<span className="sr-only">내비게이션 설정</span></button>
         </div>
-
-        {!orientationEnabled && <button type="button" className="navigation-orientation-button-fixed" onClick={enableOrientation}>방향 센서 시작</button>}
-        {orientationError && <div className="navigation-orientation-error-fixed">{orientationError}</div>}
 
         <div className="navigation-center">
           {routeLoadError ? <div className="navigation-status navigation-status--error">{routeLoadError}</div>
@@ -821,6 +931,8 @@ export default function NavigatePage() {
                   </div>
                   <strong className={hasRouteIssue ? "navigation-instruction navigation-instruction--invalid" : "navigation-instruction"}>{mainInstruction}</strong>
                   <span className="navigation-sub-instruction">{subInstruction}</span>
+                  {!orientationEnabled && <button type="button" className="navigation-orientation-button" onClick={enableOrientation}>방향 센서 시작</button>}
+                  {(orientationError || showCompassNotice) && <span className="navigation-compass-notice">{orientationError ?? "방향 센서를 확인하고 있습니다"}</span>}
                 </>}
         </div>
 
@@ -846,33 +958,28 @@ export default function NavigatePage() {
         <div className="navigation-footer">
           <div className="navigation-bottom">
             <div><small>REMAINING</small><strong>{remainingKm !== null ? `${remainingKm.toFixed(2)} KM` : "-"}</strong></div>
-            <div><small>NEXT</small><strong>{nextLabel}</strong></div>
+            <div><small>NEXT</small><strong>{nextLabel}</strong>{thenInstruction && <span className="navigation-next-then">THEN {Math.round(thenInstruction.distanceMeters ?? 0)}m {thenInstruction.type.toUpperCase()}</span>}</div>
           </div>
-          {thenInstruction && <div className="navigation-then"><small>THEN</small><strong>{Math.round(thenInstruction.distanceMeters ?? 0)}m {thenInstruction.type.toUpperCase()}</strong></div>}
           <div className="navigation-secondary-stats" aria-label="러닝 상태">
             <div><small>PACE</small><strong>{formatPace(paceSecondsPerKm)}</strong></div>
             <div><small>TIME</small><strong>{formatElapsedTime(elapsedSeconds)}</strong></div>
             <div><small>PROGRESS</small><strong>{progressLabel}</strong></div>
           </div>
-          <div className={`navigation-compass navigation-compass--${compassStatus.toLowerCase()}`}>
-            <span>◉</span> COMPASS {compassStatus}
-          </div>
-          <div className="navigation-settings">
-            <button type="button" className={voiceEnabled ? "is-active" : ""} onClick={() => setVoiceEnabled(!voiceEnabled)}>VOICE {voiceEnabled ? "ON" : "OFF"}</button>
-            <button type="button" className={vibrationEnabled ? "is-active" : ""} onClick={() => setVibrationEnabled(!vibrationEnabled)}>VIBRATION {vibrationEnabled ? "ON" : "OFF"}</button>
-            <button type="button" className={debugEnabled ? "is-active" : ""} onClick={() => setDebugEnabled(!debugEnabled)}>DEBUG</button>
-            {debugEnabled && <button type="button" onClick={exportDebugLog}>EXPORT DEBUG LOG</button>}
-          </div>
         </div>
 
-        {(showEndConfirm || showArrivalPrompt) && <div className="navigation-confirm-backdrop">
-          <section className="navigation-confirm-card">
-            <small>{showArrivalPrompt ? "ARRIVAL" : "END RUN"}</small>
-            <strong>{showArrivalPrompt ? "목적지에 도착했습니다" : "러닝을 종료할까요?"}</strong>
-            <span>기록 거리 {workoutDistanceKm.toFixed(2)} KM</span>
-            <div><button type="button" onClick={endWorkout}>러닝 종료</button><button type="button" onClick={() => { arrivalDismissedRef.current = true; setShowArrivalPrompt(false); setShowEndConfirm(false); }}>계속 진행</button></div>
-          </section>
-        </div>}
+        {showSettings && <section className="navigation-settings-sheet" id="navigation-settings" aria-label="내비게이션 설정">
+          <div className="navigation-settings-sheet__heading"><div><small>NAVIGATION SETTINGS</small><strong>러닝 안내 설정</strong></div><button type="button" onClick={() => setShowSettings(false)} aria-label="설정 닫기">×</button></div>
+          <div className="navigation-settings-sheet__rows">
+            <button type="button" onClick={() => setVoiceEnabled(!voiceEnabled)}><span>Voice Guidance</span><strong>{voiceEnabled ? "ON" : "OFF"}</strong></button>
+            <button type="button" onClick={() => setVibrationEnabled(!vibrationEnabled)}><span>Vibration</span><strong>{vibrationEnabled ? "ON" : "OFF"}</strong></button>
+            <div className="navigation-settings-sheet__status"><span>Compass</span><strong className={`is-${compassStatus.toLowerCase()}`}>{compassStatus}</strong></div>
+            <div className="navigation-settings-sheet__display"><span>Display Mode</span><div>{(["camera", "map", "simple"] as const).map((mode) => <button key={mode} type="button" className={displayMode === mode ? "is-active" : ""} onClick={() => setDisplayMode(mode)}>{mode.toUpperCase()}</button>)}</div></div>
+            {CAN_SHOW_DEBUG_CONTROLS && <div className="navigation-settings-sheet__debug"><button type="button" className={debugEnabled ? "is-active" : ""} onClick={() => setDebugEnabled(!debugEnabled)}>DEBUG {debugEnabled ? "ON" : "OFF"}</button>{debugEnabled && <button type="button" onClick={exportDebugLog}>EXPORT DEBUG LOG</button>}</div>}
+          </div>
+        </section>}
+
+        {leaveGuard.isOpen && <NavigationConfirmModal kind="leave" workoutDistanceKm={workoutDistanceKm} onCancel={cancelLeaveNavigation} onConfirm={confirmLeaveNavigation} />}
+        {(showEndConfirm || showArrivalPrompt) && <NavigationConfirmModal kind={showArrivalPrompt ? "arrival" : "end"} workoutDistanceKm={workoutDistanceKm} onConfirm={endWorkout} onCancel={() => { arrivalDismissedRef.current = true; setShowArrivalPrompt(false); setShowEndConfirm(false); }} />}
       </div>
     </main>
   );
